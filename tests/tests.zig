@@ -224,6 +224,27 @@ test "integer extremes" {
     );
 }
 
+test "integers either side of every power of ten" {
+    const T = struct {
+        a: isize, // fused run fast path
+        b: i64,
+        c: u64,
+        pub const json_tags = .{ .a = "a", .b = "b", .c = "c" };
+    };
+    var want: [128]u8 = undefined;
+    var pow: u64 = 1;
+    for (0..20) |_| {
+        for ([_]u64{ pow - 1, pow, pow + 1 }) |u| {
+            const s: i64 = @intCast(@min(u, std.math.maxInt(i64)));
+            for ([_]i64{ s, -s }) |v| {
+                const doc = try std.fmt.bufPrint(&want, "{{\"a\":{d},\"b\":{d},\"c\":{d}}}", .{ v, v, u });
+                try expectStruct(T, &.{ .a = v, .b = v, .c = u }, doc);
+            }
+        }
+        pow *%= 10;
+    }
+}
+
 test "untagged fields are skipped, arrays keep jingo's spacing" {
     const T = struct {
         hidden: isize,
@@ -283,6 +304,11 @@ test "slice encoder element kinds" {
     try expectSlice([]const p.DSUser, &&.{ .{ .username = "a" }, .{ .username = "b" } },
         \\[{"username":"a"},{"username":"b"}]
     );
+    try expectSlice([]const p.DSUser, &&.{}, "[]");
+    try expectSlice([]const []const u8, &&.{""}, "[\"\"]");
+    const t: p.DSTopic = .{ .ID = -12345678901, .slug = "" };
+    try expectSlice([]const ?*const p.DSTopic, &&.{ null, &t, null }, "[null,{\"ID\":-12345678901,\"slug\":\"\"},null]");
+    try expectSlice([]const ?*const p.DSTopic, &&.{}, "[]");
     try expectSlice([]const jz.EscapeString, &&.{ "a\\b", "\n" },
         \\["a\\b","\n"]
     );

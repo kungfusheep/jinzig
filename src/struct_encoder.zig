@@ -53,6 +53,17 @@ pub fn StructEncoder(comptime T: type) type {
 
         pub const plan: []const Op = compile(T);
 
+        /// flat types are a single run, so a slice of them can reserve once for every element
+        pub const flat = fused and runs(plan).len == 1 and bounded(plan[0].ins.kind);
+
+        pub inline fn bound(s: *const anyopaque) usize {
+            return runBound(plan, @ptrCast(s));
+        }
+
+        pub inline fn put(s: *const anyopaque, d: [*]u8) [*]u8 {
+            return putRun(plan, @ptrCast(s), d);
+        }
+
         /// init builds the runtime instruction set for T, creating any nested encoders it needs.
         pub fn init(gpa: std.mem.Allocator) Error!*Self {
             const self = try gpa.create(Self);
@@ -111,22 +122,84 @@ pub fn StructEncoder(comptime T: type) type {
         }
 
         /// marshalFused is the same plan with every branch resolved at comptime: straight-line code.
+        /// each run of statics, strings and ints reserves its upper bound once and writes through a
+        /// cursor, so the buffer's length and capacity aren't reloaded and checked on every write.
         pub fn marshalFused(s: *const anyopaque, w: *Buffer) Error!void {
             const p: [*]const u8 = @ptrCast(s);
-            inline for (plan) |op| {
-                const ins = op.ins;
-                switch (ins.kind) {
-                    .static => try w.writeStatic(ins.static),
-                    .string_field => try pc.ptrStringToBuf(@ptrCast(p + ins.offset), w),
-                    .int => try pc.PtrIntToBuf(isize).conv(@ptrCast(p + ins.offset), w),
-                    .normal => if (ins.leap_fun) |f|
-                        try f(@ptrCast(p + ins.offset), w)
-                    else
-                        try ins.fun.?(null, p, w),
+            inline for (comptime runs(plan)) |run| {
+                const ins = run[0].ins;
+                if (comptime bounded(ins.kind)) {
+                    try writeRun(run, p, w);
+                } else if (ins.leap_fun) |f| {
+                    try f(@ptrCast(p + ins.offset), w);
+                } else {
+                    try ins.fun.?(null, p, w);
                 }
             }
         }
     };
+}
+
+fn bounded(kind: Kind) bool {
+    return kind != .normal;
+}
+
+/// runs splits a plan into maximal runs of bounded ops, with every other op alone in its own run.
+fn runs(comptime plan: []const Op) []const []const Op {
+    var out: []const []const Op = &.{};
+    var start = 0;
+    for (plan, 0..) |op, i| {
+        if (bounded(op.ins.kind)) continue;
+        if (start < i) out = out ++ &[_][]const Op{plan[start..i]};
+        out = out ++ &[_][]const Op{plan[i .. i + 1]};
+        start = i + 1;
+    }
+    if (start < plan.len) out = out ++ &[_][]const Op{plan[start..]};
+    return out;
+}
+
+inline fn writeRun(comptime run: []const Op, p: [*]const u8, w: *Buffer) Error!void {
+    w.commit(putRun(run, p, try w.reserve(runBound(run, p))));
+}
+
+/// runBound is the most bytes a run can write: its statics, 20 per int, and the actual string lengths.
+inline fn runBound(comptime run: []const Op, p: [*]const u8) usize {
+    comptime var fixed = 0;
+    inline for (run) |op| fixed += switch (op.ins.kind) {
+        .static => op.ins.static.len,
+        .int => pc.max_int_len,
+        else => 0,
+    };
+    var need: usize = fixed;
+    inline for (run) |op| {
+        if (op.ins.kind == .string_field) need += field([]const u8, p, op.ins.offset).len;
+    }
+    return need;
+}
+
+/// putRun writes a run at d, which has room for runBound bytes, and returns the cursor past it.
+inline fn putRun(comptime run: []const Op, p: [*]const u8, cursor: [*]u8) [*]u8 {
+    var d = cursor;
+    inline for (run) |op| switch (op.ins.kind) {
+        .static => {
+            const v = op.ins.static;
+            d[0..v.len].* = v[0..v.len].*;
+            d += v.len;
+        },
+        .string_field => {
+            const v = field([]const u8, p, op.ins.offset);
+            buffer.copy(d, v);
+            d += v.len;
+        },
+        .int => d = pc.putInt(d, field(isize, p, op.ins.offset)),
+        .normal => comptime unreachable,
+    };
+    return d;
+}
+
+inline fn field(comptime F: type, p: [*]const u8, offset: usize) F {
+    const fp: *const F = @ptrCast(@alignCast(p + offset));
+    return fp.*;
 }
 
 /// Op is the comptime form of an instruction, carrying the nested encoder type to build at init.

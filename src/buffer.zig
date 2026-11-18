@@ -16,14 +16,23 @@ pub const Buffer = struct {
     bytes: std.ArrayList(u8) = .empty,
     next: ?*Buffer = null, // intrusive pool link
 
-    /// write a chunk of bytes to the buffer. short runtime-sized chunks (field values, digits) use
-    /// copyShort's overlapping stores; long ones go straight to memcpy.
+    /// write a chunk of bytes to the buffer.
     pub inline fn write(b: *Buffer, v: []const u8) Error!void {
-        try b.bytes.ensureUnusedCapacity(allocator, v.len);
-        const n = b.bytes.items.len;
-        b.bytes.items.len = n + v.len;
-        const dst = b.bytes.items.ptr + n;
-        if (v.len > 32) @memcpy(dst[0..v.len], v) else copyShort(dst, v);
+        const dst = try b.reserve(v.len);
+        b.bytes.items.len += v.len; // before the copy: a byte store may alias len, forcing a reload
+        copy(dst, v);
+    }
+
+    /// reserve makes room for n more bytes and returns where they start. writers that know an upper
+    /// bound up front fill it through their own cursor without further checks, then `commit` it.
+    pub inline fn reserve(b: *Buffer, n: usize) Error![*]u8 {
+        try b.bytes.ensureUnusedCapacity(allocator, n);
+        return b.bytes.items.ptr + b.bytes.items.len;
+    }
+
+    /// commit sets the length to end at a cursor returned by reserve, after it has been written.
+    pub inline fn commit(b: *Buffer, end: [*]u8) void {
+        b.bytes.items.len = @intFromPtr(end) - @intFromPtr(b.bytes.items.ptr);
     }
 
     /// writeStatic writes a comptime-known chunk (keys, braces, literals). its length is a constant,
@@ -102,6 +111,18 @@ pub const Buffer = struct {
         return b;
     }
 };
+
+/// copy writes src to dst: short runtime-sized chunks (field values, digits) use overlapping stores,
+/// long ones go straight to memcpy.
+pub inline fn copy(dst: [*]u8, src: []const u8) void {
+    if (src.len <= 32) return copyShort(dst, src);
+    if (src.len > 64) return @memcpy(dst[0..src.len], src);
+    const V = @Vector(32, u8);
+    const head: V = src[0..32].*;
+    const tail: V = src[src.len - 32 ..][0..32].*;
+    dst[0..32].* = head;
+    dst[src.len - 32 ..][0..32].* = tail;
+}
 
 /// copyShort covers [0, len) for len <= 32 with at most two overlapping stores, never writing past len.
 fn copyShort(dst: [*]u8, src: []const u8) void {

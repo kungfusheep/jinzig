@@ -136,9 +136,64 @@ pub fn SliceEncoder(comptime S: type) type {
             return n.marshalRaw(item, w);
         }
 
+        /// flat elements (plain strings, or structs that are a single run) let the whole slice reserve
+        /// once and write through one cursor, instead of updating the buffer's length per element
+        const flat = se.fused and switch (variant) {
+            .string => true,
+            .strct, .ptr_strct => Nested.flat,
+            else => false,
+        };
+
+        fn putFlat(items: []const Elem, w: *Buffer) Error!void {
+            var need: usize = 2;
+            for (items) |*item| need += 1 + elemBound(item);
+            var d = try w.reserve(need);
+            d[0] = '[';
+            d += 1;
+            for (items, 0..) |*item, i| {
+                if (i > 0) {
+                    d[0] = ',';
+                    d += 1;
+                }
+                d = putElem(item, d);
+            }
+            d[0] = ']';
+            w.commit(d + 1);
+        }
+
+        inline fn elemBound(item: *const Elem) usize {
+            return switch (variant) {
+                .string => item.len + 2,
+                .strct => Nested.bound(item),
+                .ptr_strct => if (se.deref(Elem, @ptrCast(item))) |s| Nested.bound(s) else pc.null_lit.len,
+                else => comptime unreachable,
+            };
+        }
+
+        inline fn putElem(item: *const Elem, d: [*]u8) [*]u8 {
+            switch (variant) {
+                .string => {
+                    d[0] = '"';
+                    buffer.copy(d + 1, item.*);
+                    d[item.len + 1] = '"';
+                    return d + item.len + 2;
+                },
+                .strct => return Nested.put(item, d),
+                .ptr_strct => {
+                    const s = se.deref(Elem, @ptrCast(item)) orelse {
+                        d[0..pc.null_lit.len].* = pc.null_lit.*;
+                        return d + pc.null_lit.len;
+                    };
+                    return Nested.put(s, d);
+                },
+                else => comptime unreachable,
+            }
+        }
+
         fn instr(self: ?*const Self, v: *const anyopaque, w: *Buffer) Error!void {
             const sl: *const []const Elem = @ptrCast(@alignCast(v));
             const items = sl.*;
+            if (flat) return putFlat(items, w);
 
             try w.writeByte('[');
 

@@ -182,39 +182,58 @@ const digit_pairs = blk: {
     break :blk t;
 };
 
-/// appendInt writes the base 10 form of any integer up to 64 bits, two digits at a time like strconv.
+/// max_int_len bounds putInt's output for any integer up to 64 bits: 20 digits, or "-" and 19.
+pub const max_int_len = 20;
+
+/// appendInt writes the base 10 form of any integer up to 64 bits.
 pub fn appendInt(w: *Buffer, value: anytype) Error!void {
+    w.commit(putInt(try w.reserve(max_int_len), value));
+}
+
+/// putInt writes the base 10 form of value at d, two digits at a time like strconv, and returns the
+/// cursor past it. the caller guarantees max_int_len bytes of room.
+pub inline fn putInt(d: [*]u8, value: anytype) [*]u8 {
     const T = @TypeOf(value);
-    const signed = @typeInfo(T).int.signedness == .signed;
+    var out = d;
+    var u: u64 = if (@typeInfo(T).int.signedness == .signed) @abs(value) else value;
+    if (@typeInfo(T).int.signedness == .signed and value < 0) {
+        out[0] = '-';
+        out += 1;
+    }
+    if (u < 10) {
+        out[0] = '0' + @as(u8, @intCast(u));
+        return out + 1;
+    }
 
-    var buf: [20]u8 = undefined;
-    var i: usize = buf.len;
-
-    var u: u64 = if (signed) @abs(value) else value;
+    const n = digitCount(u);
+    var i = n;
     while (u >= 100) {
-        const d: usize = @intCast((u % 100) * 2);
+        const p: usize = @intCast((u % 100) * 2);
         u /= 100;
         i -= 2;
-        buf[i..][0..2].* = digit_pairs[d..][0..2].*;
+        out[i..][0..2].* = digit_pairs[p..][0..2].*;
     }
     if (u >= 10) {
-        const d: usize = @intCast(u * 2);
-        i -= 2;
-        buf[i..][0..2].* = digit_pairs[d..][0..2].*;
+        out[0..2].* = digit_pairs[@as(usize, @intCast(u * 2))..][0..2].*;
     } else {
-        i -= 1;
-        buf[i] = '0' + @as(u8, @intCast(u));
+        out[0] = '0' + @as(u8, @intCast(u));
     }
-
-    const s = buf[i..];
-    if (signed and value < 0) {
-        const out = try w.bytes.addManyAsSlice(@import("buffer.zig").allocator, s.len + 1);
-        out[0] = '-';
-        @memcpy(out[1..], s);
-        return;
-    }
-    try w.write(s);
+    return out + n;
 }
+
+/// digitCount estimates the digits from the bit length (1233/4096 ≈ log10 2), then corrects by one.
+inline fn digitCount(u: u64) usize {
+    const bits = 64 - @as(usize, @clz(u));
+    const guess = (bits * 1233) >> 12;
+    return guess + 1 - @intFromBool(u < pow10[guess]);
+}
+
+const pow10 = blk: {
+    var t: [20]u64 = undefined;
+    t[0] = 1;
+    for (1..20) |i| t[i] = t[i - 1] * 10;
+    break :blk t;
+};
 
 /// Time is a minimal stand-in for go's time.Time: an instant plus a fixed zone offset, which is all
 /// RFC3339Nano output needs.
