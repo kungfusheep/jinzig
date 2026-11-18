@@ -1,0 +1,78 @@
+diff --git a/src/backend.zig b/src/backend.zig
+index e9deef1..b449a78 100644
+--- a/src/backend.zig
++++ b/src/backend.zig
+@@ -1,7 +1,5 @@
+-pub const c = @cImport({
+-    @cDefine("YYJSON_DISABLE_UTILS", "1");
+-    @cInclude("yyjson.h");
+-});
++// zig 0.17 removed @cImport: yyjson.h is translated by the build (translate-c, YYJSON_DISABLE_UTILS=1)
++pub const c = @import("yyjson_c");
+ const std = @import("std");
+ pub const Error = error{ InvalidJson, OutOfMemory, NumberOutOfRange, TypeMismatch, MissingField, UnknownField, DuplicateKey, InvalidPointer, NotFound, InvalidUtf8, NonFiniteNumber, DepthLimit };
+ 
+diff --git a/src/typed.zig b/src/typed.zig
+index 9b57073..f6b81d0 100644
+--- a/src/typed.zig
++++ b/src/typed.zig
+@@ -54,7 +54,7 @@ fn decode(comptime T: type, a: std.mem.Allocator, v: Value, opts: ParseOptions,
+         .@"struct" => |s| blk: {
+             if (!c.yyjson_is_obj(v.raw)) return error.TypeMismatch;
+             var out: T = undefined;
+-            inline for (s.fields) |f| {
++            inline for (comptime fieldsOf(s)) |f| {
+                 if (f.is_comptime) @compileError("Comptime struct fields are not supported");
+                 const raw = try b.unique(v.raw, f.name);
+                 if (raw != null) @field(out, f.name) = try decode(f.type, a, .{ .raw = raw }, opts, depth + 1) else if (f.defaultValue()) |default| @field(out, f.name) = default else if (@typeInfo(f.type) == .optional) @field(out, f.name) = null else return error.MissingField;
+@@ -64,7 +64,7 @@ fn decode(comptime T: type, a: std.mem.Allocator, v: Value, opts: ParseOptions,
+                 while (c.yyjson_obj_iter_next(&it)) |key| {
+                     const name = c.yyjson_get_str(key)[0..c.yyjson_get_len(key)];
+                     var known = false;
+-                    inline for (s.fields) |f| {
++                    inline for (comptime fieldsOf(s)) |f| {
+                         if (std.mem.eql(u8, name, f.name)) known = true;
+                     }
+                     if (!known) return error.UnknownField;
+@@ -118,7 +118,7 @@ fn encode(comptime T: type, doc: *c.yyjson_mut_doc, value: T, depth: usize) anye
+         .@"struct" => |s| blk: {
+             const obj = c.yyjson_mut_obj(doc);
+             if (obj == null) return error.OutOfMemory;
+-            inline for (s.fields) |f| {
++            inline for (comptime fieldsOf(s)) |f| {
+                 if (!std.unicode.utf8ValidateSlice(f.name)) return error.InvalidUtf8;
+                 const key = c.yyjson_mut_strncpy(doc, f.name.ptr, f.name.len);
+                 if (key == null) return error.OutOfMemory;
+@@ -142,3 +142,32 @@ pub fn stringify(allocator: std.mem.Allocator, value: anytype) ![]u8 {
+     defer std.heap.c_allocator.free(p[0..len]);
+     return allocator.dupe(u8, p[0..len]);
+ }
++
++/// zig 0.17 compat: rebuilds the pre-0.17 `Struct.fields` list from field_names/field_types/field_attrs.
++fn CompatField(comptime FieldType: type) type {
++    return struct {
++        name: [:0]const u8,
++        type: type = FieldType,
++        is_comptime: bool,
++        default_value_ptr: ?*const anyopaque,
++
++        pub fn defaultValue(comptime f: @This()) ?FieldType {
++            const dp: *const FieldType = @ptrCast(@alignCast(f.default_value_ptr orelse return null));
++            return dp.*;
++        }
++    };
++}
++
++fn fieldsOf(comptime info: std.builtin.Type.Struct) FieldTuple(info) {
++    var out: FieldTuple(info) = undefined;
++    inline for (info.field_names, info.field_types, info.field_attrs, 0..) |n, t, a, i| {
++        out[i] = CompatField(t){ .name = n, .is_comptime = a.@"comptime", .default_value_ptr = a.default_value_ptr };
++    }
++    return out;
++}
++
++fn FieldTuple(comptime info: std.builtin.Type.Struct) type {
++    var types: [info.field_types.len]type = undefined;
++    for (&types, info.field_types) |*t, ft| t.* = CompatField(ft);
++    return @Tuple(&types);
++}

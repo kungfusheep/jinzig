@@ -1,0 +1,364 @@
+diff --git a/src/main.zig b/src/main.zig
+index 04f483e..6455225 100644
+--- a/src/main.zig
++++ b/src/main.zig
+@@ -3,8 +3,25 @@
+ 
+ const std = @import("std");
+ 
++// zig 0.17 compat: rebuilds the pre-0.17 field list from field_names/field_types
++const Field = struct { name: [:0]const u8, type: type };
++
++inline fn fieldList(comptime T: type) []const Field {
++    comptime {
++        const info = switch (@typeInfo(T)) {
++            .@"struct" => |i| .{ i.field_names, i.field_types },
++            .@"union" => |i| .{ i.field_names, i.field_types },
++            else => unreachable,
++        };
++        var out: [info[0].len]Field = undefined;
++        for (&out, info[0], info[1]) |*f, n, t| f.* = .{ .name = n, .type = t };
++        const final = out;
++        return &final;
++    }
++}
++
+ pub const json = struct {
+-    pub fn stringify(value: anytype, writer: std.io.AnyWriter) !void {
++    pub fn stringify(value: anytype, writer: *std.Io.Writer) !void {
+         const T = @TypeOf(value);
+         if (isString(T, value)) {
+             try writer.writeAll("\"");
+@@ -19,26 +36,26 @@ pub const json = struct {
+         }
+     }
+ 
+-    fn stringifyValue(value: anytype, writer: std.io.AnyWriter) !void {
++    fn stringifyValue(value: anytype, writer: *std.Io.Writer) !void {
+         const T = @TypeOf(value);
+         switch (@typeInfo(T)) {
+-            .Bool => try writer.writeAll(if (value) "true" else "false"),
+-            .Int => try stringifyInt(value, writer),
+-            .ComptimeInt => try writer.print("{d}", .{value}),
+-            .Float => try writer.print("{d}", .{value}),
+-            .ComptimeFloat => try writer.print("{d}", .{value}),
+-            .Pointer => |ptr_info| switch (ptr_info.size) {
+-                .One => switch (@typeInfo(ptr_info.child)) {
+-                    .Array => |array_info| if (array_info.child == u8)
++            .bool => try writer.writeAll(if (value) "true" else "false"),
++            .int => try stringifyInt(value, writer),
++            .comptime_int => try writer.print("{d}", .{value}),
++            .float => try writer.print("{d}", .{value}),
++            .comptime_float => try writer.print("{d}", .{value}),
++            .pointer => |ptr_info| switch (ptr_info.size) {
++                .one => switch (@typeInfo(ptr_info.child)) {
++                    .array => |array_info| if (array_info.child == u8)
+                         try writer.writeAll(@as([]const std.meta.Elem(ptr_info.child), value))
+                     else
+                         try stringifyArray(@as([]const std.meta.Elem(ptr_info.child), value), writer),
+                     else => try stringifyValue(value.*, writer),
+                 },
+-                .Many, .Slice => {
+-                    if (ptr_info.size == .Many and ptr_info.sentinel == null)
++                .many, .slice => {
++                    if (ptr_info.size == .many and ptr_info.sentinel_ptr == null)
+                         @compileError("Cannot stringify type '" ++ @typeName(T) ++ "' without sentinel");
+-                    const slice = if (ptr_info.size == .Many) std.mem.span(value) else value;
++                    const slice = if (ptr_info.size == .many) std.mem.span(value) else value;
+                     if (ptr_info.child == u8)
+                         try writer.writeAll(slice)
+                     else
+@@ -46,11 +63,11 @@ pub const json = struct {
+                 },
+                 else => @compileError("Cannot stringify type '" ++ @typeName(T) ++ "'"),
+             },
+-            .Array => |array_info| if (array_info.child == u8)
++            .array => |array_info| if (array_info.child == u8)
+                 try writer.writeAll(@as([]const array_info.child, &value))
+             else
+                 try stringifyArray(@as([]const array_info.child, &value), writer),
+-            .Struct => |struct_info| if (struct_info.is_tuple)
++            .@"struct" => |struct_info| if (struct_info.is_tuple)
+                 try stringifyTuple(value, writer)
+             else if (isArray(T))
+                 try stringifyArray(value.items, writer)
+@@ -58,24 +75,24 @@ pub const json = struct {
+                 try stringifyHashMap(value, writer)
+             else
+                 try stringifyStruct(value, writer),
+-            .Null => try writer.writeAll("null"),
+-            .Optional => if (value) |unwrapped| try stringifyValue(unwrapped, writer) else try writer.writeAll("null"),
+-            .Enum => |enum_info| if (enum_info.is_exhaustive) try writer.writeAll(@tagName(value)) else {
++            .null => try writer.writeAll("null"),
++            .optional => if (value) |unwrapped| try stringifyValue(unwrapped, writer) else try writer.writeAll("null"),
++            .@"enum" => |enum_info| if (enum_info.mode == .exhaustive) try writer.writeAll(@tagName(value)) else {
+                 if (std.enums.tagName(T, value)) |tag|
+                     try writer.writeAll(tag)
+                 else
+                     try writer.print("{d}", .{@as(enum_info.tag_type, @intFromEnum(value))});
+             },
+-            .EnumLiteral => try writer.writeAll(@tagName(value)),
+-            .Union => try stringifyUnion(value, writer),
++            .enum_literal => try writer.writeAll(@tagName(value)),
++            .@"union" => try stringifyUnion(value, writer),
+             else => @compileError("Cannot stringify type '" ++ @typeName(T) ++ "'"),
+         }
+     }
+ 
+-    fn stringifyInt(value: anytype, writer: std.io.AnyWriter) !void {
++    fn stringifyInt(value: anytype, writer: *std.Io.Writer) !void {
+         const char_map = "0123456789";
+         const T = @TypeOf(value);
+-        const int_info = @typeInfo(T).Int;
++        const int_info = @typeInfo(T).int;
+         var abs_value = if (int_info.signedness == .unsigned) value else @abs(value);
+         const digit_count = comptime blk: {
+             break :blk std.math.log10(std.math.maxInt(T)) +
+@@ -100,7 +117,7 @@ pub const json = struct {
+         try writer.writeAll(buf[index..]);
+     }
+ 
+-    fn stringifyArray(value: anytype, writer: std.io.AnyWriter) !void {
++    fn stringifyArray(value: anytype, writer: *std.Io.Writer) !void {
+         if (value.len == 0) {
+             return;
+         }
+@@ -111,11 +128,11 @@ pub const json = struct {
+         try stringifyValue(value[value.len - 1], writer);
+     }
+ 
+-    fn stringifyUnion(value: anytype, writer: std.io.AnyWriter) !void {
++    fn stringifyUnion(value: anytype, writer: *std.Io.Writer) !void {
+         const T = @TypeOf(value);
+-        const union_info = @typeInfo(T).Union;
++        const union_info = @typeInfo(T).@"union";
+         if (union_info.tag_type) |UnionTagType| {
+-            const fields: []const std.builtin.Type.UnionField = std.meta.fields(T);
++            const fields: []const Field = fieldList(T);
+             inline for (fields) |field| {
+                 if (value == @field(UnionTagType, field.name)) {
+                     const array_open = if (isArray(field.type)) "[" else "";
+@@ -138,11 +155,11 @@ pub const json = struct {
+         }
+     }
+ 
+-    fn stringifyStruct(value: anytype, writer: std.io.AnyWriter) !void {
++    fn stringifyStruct(value: anytype, writer: *std.Io.Writer) !void {
+         const T = @TypeOf(value);
+-        const fields: []const std.builtin.Type.StructField = std.meta.fields(T);
++        const fields: []const Field = fieldList(T);
+         inline for (fields, 0..) |field, i| {
+-            const prev_field: ?std.builtin.Type.StructField = if (i != 0) fields[i - 1] else null;
++            const prev_field: ?Field = if (i != 0) fields[i - 1] else null;
+             const prev_array_close = if (prev_field != null and isArray(prev_field.?.type)) "]" else "";
+             const prev_string_close = if (prev_field != null and isString(prev_field.?.type, @field(value, prev_field.?.name))) "\"" else "";
+             const object_open_or_comma = if (i == 0) "{" else ",";
+@@ -159,13 +176,13 @@ pub const json = struct {
+         try writer.writeAll(last_array_close ++ last_string_close ++ "}");
+     }
+ 
+-    fn stringifyTuple(value: anytype, writer: std.io.AnyWriter) !void {
++    fn stringifyTuple(value: anytype, writer: *std.Io.Writer) !void {
+         const T = @TypeOf(value);
+-        const struct_info = @typeInfo(T).Struct;
++        const struct_info = @typeInfo(T).@"struct";
+         if (!struct_info.is_tuple) @compileError("Expected a tuple but got '" ++ @typeName(T) ++ "'");
+-        const fields: []const std.builtin.Type.StructField = std.meta.fields(T);
++        const fields: []const Field = fieldList(T);
+         inline for (fields, 0..) |field, i| {
+-            const prev_field: ?std.builtin.Type.StructField = if (i != 0) fields[i - 1] else null;
++            const prev_field: ?Field = if (i != 0) fields[i - 1] else null;
+             const prev_array_close = if (i != 0 and isArray(prev_field.?.type)) "]" else "";
+             const prev_string_close = if (i != 0 and isString(prev_field.?.type, @field(value, prev_field.?.name))) "\"" else "";
+             const array_open_or_comma = if (i == 0) "[" else ",";
+@@ -180,7 +197,7 @@ pub const json = struct {
+         try writer.writeAll(last_array_close ++ last_string_close ++ "]");
+     }
+ 
+-    fn stringifyHashMap(value: anytype, writer: std.io.AnyWriter) !void {
++    fn stringifyHashMap(value: anytype, writer: *std.Io.Writer) !void {
+         const T = @TypeOf(value);
+         const TKey = getHashMapKeyType(T);
+         const TVal = getHashMapValueType(T);
+@@ -211,11 +228,11 @@ pub const json = struct {
+     inline fn isArray(T: type) bool {
+         comptime {
+             return switch (@typeInfo(T)) {
+-                .Array => |array_type_info| array_type_info.child != u8,
+-                .Pointer => |ptr_type_info| ptr_type_info.child != u8,
+-                .Struct => @hasField(T, "items") and
+-                    (T == std.ArrayList(std.meta.Child(std.meta.FieldType(T, .items))) or
+-                    T == std.ArrayListUnmanaged(std.meta.Child(std.meta.FieldType(T, .items)))),
++                .array => |array_type_info| array_type_info.child != u8,
++                .pointer => |ptr_type_info| ptr_type_info.child != u8,
++                .@"struct" => @hasField(T, "items") and
++                    (T == std.ArrayList(std.meta.Child(@FieldType(T, "items"))) or
++                    T == std.ArrayListUnmanaged(std.meta.Child(@FieldType(T, "items")))),
+                 else => false,
+             };
+         }
+@@ -223,7 +240,7 @@ pub const json = struct {
+ 
+     inline fn isHashMap(comptime T: type) bool {
+         comptime {
+-            return std.meta.activeTag(@typeInfo(T)) == .Struct and
++            return std.meta.activeTag(@typeInfo(T)) == .@"struct" and
+                 @hasDecl(T, "iterator") and
+                 (T == std.StringHashMapUnmanaged(getHashMapValueType(T)) or
+                 T == std.AutoHashMapUnmanaged(getHashMapKeyType(T), getHashMapValueType(T)));
+@@ -233,44 +250,44 @@ pub const json = struct {
+     inline fn hasToString(comptime T: type) bool {
+         comptime {
+             return switch (@typeInfo(T)) {
+-                .Struct => @hasDecl(T, "toString"),
++                .@"struct" => @hasDecl(T, "toString"),
+                 else => false,
+             };
+         }
+     }
+ 
+     inline fn getHashMapKeyType(comptime T: type) type {
+-        return @typeInfo(@typeInfo(@TypeOf(T.getKey)).Fn.return_type.?).Optional.child;
++        return @typeInfo(@typeInfo(@TypeOf(T.getKey)).@"fn".return_type.?).optional.child;
+     }
+ 
+     inline fn getHashMapValueType(comptime T: type) type {
+-        return @typeInfo(@typeInfo(@TypeOf(T.get)).Fn.return_type.?).Optional.child;
++        return @typeInfo(@typeInfo(@TypeOf(T.get)).@"fn".return_type.?).optional.child;
+     }
+ 
+     inline fn isString(T: type, val: T) bool {
+         return switch (@typeInfo(T)) {
+-            .Array => |array_info| array_info.child == u8,
+-            .Pointer => |ptr_info| switch (ptr_info.size) {
+-                .One => switch (@typeInfo(ptr_info.child)) {
+-                    .Array => |array_info| array_info.child == u8,
++            .array => |array_info| array_info.child == u8,
++            .pointer => |ptr_info| switch (ptr_info.size) {
++                .one => switch (@typeInfo(ptr_info.child)) {
++                    .array => |array_info| array_info.child == u8,
+                     else => false,
+                 },
+-                .Many, .Slice => ptr_info.child == u8,
++                .many, .slice => ptr_info.child == u8,
+                 else => false,
+             },
+-            .Enum => |enum_info| if (enum_info.is_exhaustive)
++            .@"enum" => |enum_info| if (enum_info.mode == .exhaustive)
+                 true
+             else
+                 std.enums.tagName(T, val) != null,
+-            .EnumLiteral => true,
++            .enum_literal => true,
+             else => false,
+         };
+     }
+ 
+     pub fn stringifyAlloc(allocator: std.mem.Allocator, value: anytype) ![]const u8 {
+-        var buf = std.ArrayList(u8).init(allocator);
++        var buf: std.Io.Writer.Allocating = .init(allocator);
+         errdefer buf.deinit();
+-        try stringify(value, buf.writer().any());
++        try stringify(value, &buf.writer);
+         return buf.toOwnedSlice();
+     }
+ };
+@@ -354,12 +371,12 @@ test "stringify array" {
+ }
+ 
+ test "stringify tuple" {
+-    try testStringify("[\"foo\",42]", std.meta.Tuple(&.{ []const u8, usize }){ "foo", 42 });
++    try testStringify("[\"foo\",42]", struct { []const u8, usize }{ "foo", 42 });
+ }
+ 
+ test "stringify std.ArrayList and std.ArrayListUnmanaged" {
+     {
+-        var list: std.ArrayListUnmanaged(u32) = .{};
++        var list: std.ArrayListUnmanaged(u32) = .empty;
+         defer list.deinit(std.testing.allocator);
+         try list.append(std.testing.allocator, 1);
+         try list.append(std.testing.allocator, 2);
+@@ -367,11 +384,12 @@ test "stringify std.ArrayList and std.ArrayListUnmanaged" {
+         try testStringify("[1,2,3]", list);
+     }
+     {
+-        var list = std.ArrayList(u32).init(std.testing.allocator);
+-        defer list.deinit();
+-        try list.append(1);
+-        try list.append(2);
+-        try list.append(3);
++        // zig 0.17: ArrayList is the unmanaged list
++        var list: std.ArrayList(u32) = .empty;
++        defer list.deinit(std.testing.allocator);
++        try list.append(std.testing.allocator, 1);
++        try list.append(std.testing.allocator, 2);
++        try list.append(std.testing.allocator, 3);
+         try testStringify("[1,2,3]", list);
+     }
+ }
+@@ -379,7 +397,7 @@ test "stringify std.ArrayList and std.ArrayListUnmanaged" {
+ test "stringify hash maps" {
+     {
+         // u32 -> bool
+-        var hashmap: std.AutoHashMapUnmanaged(u32, bool) = .{};
++        var hashmap: std.AutoHashMapUnmanaged(u32, bool) = .empty;
+         defer hashmap.deinit(std.testing.allocator);
+         try hashmap.put(std.testing.allocator, 123, true);
+         try hashmap.put(std.testing.allocator, 456, false);
+@@ -387,7 +405,7 @@ test "stringify hash maps" {
+     }
+     {
+         // bool -> u32
+-        var hashmap: std.AutoHashMapUnmanaged(bool, u32) = .{};
++        var hashmap: std.AutoHashMapUnmanaged(bool, u32) = .empty;
+         defer hashmap.deinit(std.testing.allocator);
+         try hashmap.put(std.testing.allocator, true, 123);
+         try hashmap.put(std.testing.allocator, false, 456);
+@@ -398,11 +416,11 @@ test "stringify hash maps" {
+         const Foo = struct { foo: []const u8, bar: f32 };
+         var hashmap: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(Foo)) = .{};
+         defer hashmap.deinit(std.testing.allocator);
+-        try hashmap.put(std.testing.allocator, 1, .{});
++        try hashmap.put(std.testing.allocator, 1, .empty);
+         defer hashmap.getPtr(1).?.deinit(std.testing.allocator);
+         try hashmap.getPtr(1).?.append(std.testing.allocator, .{ .foo = "hello", .bar = 123 });
+         try hashmap.getPtr(1).?.append(std.testing.allocator, .{ .foo = "world", .bar = 456 });
+-        try hashmap.put(std.testing.allocator, 2, .{});
++        try hashmap.put(std.testing.allocator, 2, .empty);
+         defer hashmap.getPtr(2).?.deinit(std.testing.allocator);
+         try hashmap.getPtr(2).?.append(std.testing.allocator, .{ .foo = "bye", .bar = 789 });
+         try hashmap.getPtr(2).?.append(std.testing.allocator, .{ .foo = "world", .bar = 0.1 });
+@@ -410,7 +428,7 @@ test "stringify hash maps" {
+     }
+     {
+         // string -> string
+-        var hashmap: std.StringHashMapUnmanaged([]const u8) = .{};
++        var hashmap: std.StringHashMapUnmanaged([]const u8) = .empty;
+         defer hashmap.deinit(std.testing.allocator);
+         try hashmap.put(std.testing.allocator, "hello", "world");
+         try hashmap.put(std.testing.allocator, "bye", "world");
+@@ -422,13 +440,13 @@ test "stringify hash maps" {
+             foo: [10]u8,
+             bar: [10]u8,
+             pub fn toString(self: @This()) [20]u8 {
+-                var buf: [20]u8 = .{0} ** 20;
++                var buf: [20]u8 = @splat(0);
+                 buf[0..10].* = self.foo;
+                 buf[10..20].* = self.bar;
+                 return buf;
+             }
+         };
+-        var hashmap: std.AutoHashMapUnmanaged(Foo, bool) = .{};
++        var hashmap: std.AutoHashMapUnmanaged(Foo, bool) = .empty;
+         defer hashmap.deinit(std.testing.allocator);
+         try hashmap.put(std.testing.allocator, .{ .foo = "1234567890".*, .bar = "abcdefghij".* }, true);
+         try hashmap.put(std.testing.allocator, .{ .foo = "abcdefghij".*, .bar = "1234567890".* }, false);
+@@ -436,7 +454,7 @@ test "stringify hash maps" {
+     }
+     {
+         // empty
+-        var hashmap: std.AutoHashMapUnmanaged(u32, u32) = .{};
++        var hashmap: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+         defer hashmap.deinit(std.testing.allocator);
+         try testStringify("{}", hashmap);
+     }

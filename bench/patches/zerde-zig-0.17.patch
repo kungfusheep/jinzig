@@ -1,0 +1,168 @@
+diff --git a/src/meta.zig b/src/meta.zig
+index 228e55d..c8e2796 100644
+--- a/src/meta.zig
++++ b/src/meta.zig
+@@ -27,7 +27,7 @@ pub const JsonConfig = SerdeConfig;
+ pub fn hasField(comptime T: type, comptime name: []const u8) bool {
+     return switch (@typeInfo(T)) {
+         .@"struct" => |info| blk: {
+-            inline for (info.fields) |field| {
++            inline for (fieldsOf(info)) |field| {
+                 if (std.mem.eql(u8, field.name, name)) break :blk true;
+             }
+             break :blk false;
+@@ -182,3 +182,22 @@ test "case conversion" {
+     try std.testing.expectEqualStrings("http_server", applyCase("HTTPServer", .snake_case));
+     try std.testing.expectEqualStrings("http-server", applyCase("HTTPServer", .kebab_case));
+ }
++
++/// zig 0.17 compat: rebuilds the pre-0.17 `Struct.fields` list from field_names/field_types/field_attrs.
++pub const CompatField = struct {
++    name: [:0]const u8,
++    type: type,
++    is_comptime: bool,
++    default_value_ptr: ?*const anyopaque,
++};
++
++pub inline fn fieldsOf(comptime info: std.builtin.Type.Struct) []const CompatField {
++    comptime {
++        var out: [info.field_names.len]CompatField = undefined;
++        for (&out, info.field_names, info.field_types, info.field_attrs) |*f, n, t, a| {
++            f.* = .{ .name = n, .type = t, .is_comptime = a.@"comptime", .default_value_ptr = a.default_value_ptr };
++        }
++        const final = out;
++        return &final;
++    }
++}
+diff --git a/src/typed.zig b/src/typed.zig
+index bd49924..c4bdf19 100644
+--- a/src/typed.zig
++++ b/src/typed.zig
+@@ -163,7 +163,7 @@ fn serializeValue(serializer: anytype, value: anytype, comptime cfg: anytype) !v
+             if (@hasDecl(SerializerType, "beginStructSized")) {
+                 var field_count: usize = 0;
+                 inline for (0..pass_count) |pass| {
+-                    inline for (info.fields) |field| {
++                    inline for (meta.fieldsOf(info)) |field| {
+                         if (field.is_comptime) {
+                             @compileError("comptime struct fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
+                         }
+@@ -180,7 +180,7 @@ fn serializeValue(serializer: anytype, value: anytype, comptime cfg: anytype) !v
+                 try serializer.beginStruct(T);
+             }
+             inline for (0..pass_count) |pass| {
+-                inline for (info.fields) |field| {
++                inline for (meta.fieldsOf(info)) |field| {
+                     if (field.is_comptime) {
+                         @compileError("comptime struct fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
+                     }
+@@ -467,10 +467,10 @@ fn deserializeStruct(
+         try deserializer.beginStructOrdered(T);
+ 
+         var ordered_result: T = undefined;
+-        var ordered_seen: [info.fields.len]bool = [_]bool{false} ** info.fields.len;
++        var ordered_seen: [meta.fieldsOf(info).len]bool = @splat(false);
+         errdefer freePartialStruct(T, allocator, &ordered_result, &ordered_seen, borrowed_strings);
+ 
+-        inline for (info.fields, 0..) |struct_field, i| {
++        inline for (meta.fieldsOf(info), 0..) |struct_field, i| {
+             if (struct_field.is_comptime) {
+                 @compileError("comptime struct fields are not supported: " ++ @typeName(T) ++ "." ++ struct_field.name);
+             }
+@@ -486,7 +486,7 @@ fn deserializeStruct(
+     try deserializer.beginObject();
+ 
+     var result: T = undefined;
+-    var seen: [info.fields.len]bool = [_]bool{false} ** info.fields.len;
++    var seen: [meta.fieldsOf(info).len]bool = @splat(false);
+     errdefer freePartialStruct(T, allocator, &result, &seen, borrowed_strings);
+ 
+     if (@hasDecl(DeserializerType, "nextObjectFieldIndex")) {
+@@ -498,7 +498,7 @@ fn deserializeStruct(
+                     try deserializer.skipValue(allocator);
+                 },
+                 .field_index => |field_index| {
+-                    inline for (info.fields, 0..) |struct_field, i| {
++                    inline for (meta.fieldsOf(info), 0..) |struct_field, i| {
+                         if (field_index == i) {
+                             if (seen[i]) return error.DuplicateField;
+                             @field(result, struct_field.name) = try deserializeFieldValue(struct_field.type, allocator, deserializer, cfg, diagnostics, track_diagnostics, struct_field.name);
+@@ -509,7 +509,7 @@ fn deserializeStruct(
+             }
+         }
+ 
+-        inline for (info.fields, 0..) |struct_field, i| {
++        inline for (meta.fieldsOf(info), 0..) |struct_field, i| {
+             if (!seen[i]) {
+                 if (struct_field.defaultValue()) |default_value| {
+                     @field(result, struct_field.name) = default_value;
+@@ -528,7 +528,7 @@ fn deserializeStruct(
+         defer field_name.deinit(allocator);
+ 
+         if (matchStructFieldIndexInfo(T, info, cfg, field_name.bytes)) |field_index| {
+-            inline for (info.fields, 0..) |struct_field, i| {
++            inline for (meta.fieldsOf(info), 0..) |struct_field, i| {
+                 if (field_index == i) {
+                     if (seen[i]) return error.DuplicateField;
+                     @field(result, struct_field.name) = try deserializeFieldValue(struct_field.type, allocator, deserializer, cfg, diagnostics, track_diagnostics, struct_field.name);
+@@ -543,7 +543,7 @@ fn deserializeStruct(
+     }
+ 
+     // Missing-field defaults are resolved after the object is fully consumed.
+-    inline for (info.fields, 0..) |struct_field, i| {
++    inline for (meta.fieldsOf(info), 0..) |struct_field, i| {
+         if (!seen[i]) {
+             if (struct_field.defaultValue()) |default_value| {
+                 @field(result, struct_field.name) = default_value;
+@@ -600,7 +600,7 @@ fn matchStructFieldIndexInfo(
+     comptime cfg: anytype,
+     actual: []const u8,
+ ) ?usize {
+-    inline for (info.fields, 0..) |field, i| {
++    inline for (meta.fieldsOf(info), 0..) |field, i| {
+         const expected_name = meta.effectiveFieldName(T, field.name, cfg);
+         if (expected_name.len == actual.len and isFirstFieldWithNameLen(T, info, cfg, i)) {
+             return matchStructFieldIndexByLen(T, info, cfg, actual, expected_name.len);
+@@ -617,7 +617,7 @@ fn matchStructFieldIndexByLen(
+     actual: []const u8,
+     len: usize,
+ ) ?usize {
+-    inline for (info.fields, 0..) |field, i| {
++    inline for (meta.fieldsOf(info), 0..) |field, i| {
+         const expected_name = meta.effectiveFieldName(T, field.name, cfg);
+         if (expected_name.len == len and std.mem.eql(u8, actual, expected_name)) {
+             return i;
+@@ -633,9 +633,9 @@ fn isFirstFieldWithNameLen(
+     comptime cfg: anytype,
+     comptime field_index: usize,
+ ) bool {
+-    const field = info.fields[field_index];
++    const field = meta.fieldsOf(info)[field_index];
+     const field_name = meta.effectiveFieldName(T, field.name, cfg);
+-    inline for (info.fields[0..field_index]) |prior_field| {
++    inline for (meta.fieldsOf(info)[0..field_index]) |prior_field| {
+         if (meta.effectiveFieldName(T, prior_field.name, cfg).len == field_name.len) {
+             return false;
+         }
+@@ -673,7 +673,7 @@ fn freeTypedPartial(comptime T: type, allocator: Allocator, value: T, borrowed_s
+             else => {},
+         },
+         .@"struct" => |info| {
+-            inline for (info.fields) |field| {
++            inline for (meta.fieldsOf(info)) |field| {
+                 if (!field.is_comptime) {
+                     freeTypedPartial(field.type, allocator, @field(value, field.name), borrowed_strings);
+                 }
+@@ -687,10 +687,10 @@ fn freePartialStruct(
+     comptime T: type,
+     allocator: Allocator,
+     result: *T,
+-    seen: *[@typeInfo(T).@"struct".fields.len]bool,
++    seen: *[meta.fieldsOf(@typeInfo(T).@"struct").len]bool,
+     borrowed_strings: bool,
+ ) void {
+-    inline for (@typeInfo(T).@"struct".fields, 0..) |field, i| {
++    inline for (meta.fieldsOf(@typeInfo(T).@"struct"), 0..) |field, i| {
+         if (seen[i]) freeTypedPartial(field.type, allocator, @field(result.*, field.name), borrowed_strings);
+     }
+ }

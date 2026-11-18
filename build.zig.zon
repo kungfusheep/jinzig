@@ -1,0 +1,7 @@
+.{
+    .name = .jinzig,
+    .version = "0.1.0",
+    .fingerprint = 0x69f9d100106c0973,
+    .minimum_zig_version = "0.17.0",
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
