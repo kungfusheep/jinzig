@@ -1,13 +1,10 @@
 //! struct_encoder.zig manages StructEncoder and its responsibilities.
 //! The general goal of the approach is to do as much of the necessary work as possible inside
 //! the 'compile' stage. In jingo that happens at runtime via reflect; here the instruction set is
-//! compiled from @typeInfo at comptime and `init` materialises it into a runtime instruction slice.
-//!
-//! With -Dmode=interpreted (the default) marshal walks that slice exactly as jingo's Marshal does.
-//! With -Dmode=fused the same comptime plan is unrolled with `inline for`, removing the dispatch loop.
+//! compiled from @typeInfo at comptime and unrolled with `inline for`, so marshal is straight-line
+//! code with no dispatch loop and an encoder has no runtime state to build.
 
 const std = @import("std");
-const build_options = @import("build_options");
 const buffer = @import("buffer.zig");
 const pc = @import("ptrconvert.zig");
 const SliceEncoder = @import("slice_encoder.zig").SliceEncoder;
@@ -17,22 +14,18 @@ const Error = buffer.Error;
 const Conv = pc.Conv;
 const Time = pc.Time;
 
-pub const fused = build_options.mode == .fused;
-
-pub const Fun = *const fn (ctx: ?*const anyopaque, v: [*]const u8, w: *Buffer) Error!void;
+pub const Fun = *const fn (v: [*]const u8, w: *Buffer) Error!void;
 
 pub const Kind = enum(u8) { normal, string_field, static, int };
 
 /// Instruction describes the different ways we can execute a single instruction at runtime.
-/// static, leap_fun/offset, fun are mutually exclusive. ctx stands in for whatever a go closure
-/// would have captured at runtime (a nested encoder).
+/// static, leap_fun/offset, fun are mutually exclusive.
 pub const Instruction = struct {
     static: []const u8 = "", // fast path for writing static chunks without needing an instruction function
     kind: Kind = .normal, // used to switch special paths in marshal, like string fast path
     offset: usize = 0, // used in conjunction with leap_fun
     leap_fun: ?Conv = null, // fast path for simple write & avoids wrapping function to capture offset
     fun: ?Fun = null, // full instruction function for when the approaches above fail
-    ctx: ?*const anyopaque = null,
 };
 
 /// JSONEncoder works with the `,encoder` option: declare `pub fn jsonEncode(self: *const T, w: *Buffer) Error!void`.
@@ -46,15 +39,10 @@ pub fn StructEncoder(comptime T: type) type {
     if (@typeInfo(T) != .@"struct") @compileError("StructEncoder requires a struct, got " ++ @typeName(T));
 
     return struct {
-        const Self = @This();
-
-        instructions: []Instruction, // the instruction set to be executed during marshal
-        gpa: std.mem.Allocator,
-
-        pub const plan: []const Op = compile(T);
+        pub const plan: []const Instruction = compile(T);
 
         /// flat types are a single run, so a slice of them can reserve once for every element
-        pub const flat = fused and runs(plan).len == 1 and bounded(plan[0].ins.kind);
+        pub const flat = runs(plan).len == 1 and bounded(plan[0].kind);
 
         pub inline fn bound(s: *const anyopaque) usize {
             return runBound(plan, @ptrCast(s));
@@ -64,76 +52,24 @@ pub fn StructEncoder(comptime T: type) type {
             return putRun(plan, @ptrCast(s), d);
         }
 
-        /// init builds the runtime instruction set for T, creating any nested encoders it needs.
-        pub fn init(gpa: std.mem.Allocator) Error!*Self {
-            const self = try gpa.create(Self);
-            errdefer gpa.destroy(self);
-            const instructions = try gpa.alloc(Instruction, plan.len);
-            self.* = .{ .instructions = instructions, .gpa = gpa };
-
-            inline for (plan, 0..) |op, i| {
-                instructions[i] = op.ins;
-                if (op.nested) |Enc| {
-                    // handle recursive structs by re-using the current encoder
-                    instructions[i].ctx = if (Enc == Self) self else try Enc.init(gpa);
-                }
-            }
-            return self;
+        /// marshal writes the json document for a given value to the buffer provided
+        pub fn marshal(s: *const T, w: *Buffer) Error!void {
+            return marshalRaw(s, w);
         }
 
-        pub fn deinit(self: *Self) void {
-            inline for (plan, 0..) |op, i| {
-                if (op.nested) |Enc| if (Enc != Self) {
-                    const n: *Enc = @ptrCast(@alignCast(@constCast(self.instructions[i].ctx.?)));
-                    n.deinit();
-                };
-            }
-            self.gpa.free(self.instructions);
-            self.gpa.destroy(self);
-        }
-
-        /// marshal executes the instructions for a given value and writes the resulting
-        /// json document to the buffer provided
-        pub fn marshal(self: *const Self, s: *const T, w: *Buffer) Error!void {
-            return self.marshalRaw(s, w);
-        }
-
-        pub fn marshalRaw(self: *const Self, s: *const anyopaque, w: *Buffer) Error!void {
-            if (fused) return marshalFused(s, w);
-
-            const p: [*]const u8 = @ptrCast(s);
-            for (self.instructions) |*ins| {
-                if (ins.kind == .static) { // static data fast path
-                    try w.write(ins.static);
-                    continue;
-                } else if (ins.kind == .string_field) { // string fields fast path
-                    try pc.ptrStringToBuf(@ptrCast(p + ins.offset), w);
-                    continue;
-                } else if (ins.kind == .int) { // int fields fast path
-                    try pc.PtrIntToBuf(isize).conv(@ptrCast(p + ins.offset), w);
-                    continue;
-                } else if (ins.leap_fun) |f| { // simple 'conv' function fast path
-                    try f(@ptrCast(p + ins.offset), w);
-                    continue;
-                }
-
-                try ins.fun.?(ins.ctx, p, w); // all other instruction types
-            }
-        }
-
-        /// marshalFused is the same plan with every branch resolved at comptime: straight-line code.
+        /// marshalRaw is the plan with every branch resolved at comptime: straight-line code.
         /// each run of statics, strings and ints reserves its upper bound once and writes through a
         /// cursor, so the buffer's length and capacity aren't reloaded and checked on every write.
-        pub fn marshalFused(s: *const anyopaque, w: *Buffer) Error!void {
+        pub fn marshalRaw(s: *const anyopaque, w: *Buffer) Error!void {
             const p: [*]const u8 = @ptrCast(s);
             inline for (comptime runs(plan)) |run| {
-                const ins = run[0].ins;
+                const ins = run[0];
                 if (comptime bounded(ins.kind)) {
                     try writeRun(run, p, w);
                 } else if (ins.leap_fun) |f| {
                     try f(@ptrCast(p + ins.offset), w);
                 } else {
-                    try ins.fun.?(null, p, w);
+                    try ins.fun.?(p, w);
                 }
             }
         }
@@ -145,53 +81,53 @@ fn bounded(kind: Kind) bool {
 }
 
 /// runs splits a plan into maximal runs of bounded ops, with every other op alone in its own run.
-fn runs(comptime plan: []const Op) []const []const Op {
-    var out: []const []const Op = &.{};
+fn runs(comptime plan: []const Instruction) []const []const Instruction {
+    var out: []const []const Instruction = &.{};
     var start = 0;
     for (plan, 0..) |op, i| {
-        if (bounded(op.ins.kind)) continue;
-        if (start < i) out = out ++ &[_][]const Op{plan[start..i]};
-        out = out ++ &[_][]const Op{plan[i .. i + 1]};
+        if (bounded(op.kind)) continue;
+        if (start < i) out = out ++ &[_][]const Instruction{plan[start..i]};
+        out = out ++ &[_][]const Instruction{plan[i .. i + 1]};
         start = i + 1;
     }
-    if (start < plan.len) out = out ++ &[_][]const Op{plan[start..]};
+    if (start < plan.len) out = out ++ &[_][]const Instruction{plan[start..]};
     return out;
 }
 
-inline fn writeRun(comptime run: []const Op, p: [*]const u8, w: *Buffer) Error!void {
+inline fn writeRun(comptime run: []const Instruction, p: [*]const u8, w: *Buffer) Error!void {
     w.commit(putRun(run, p, try w.reserve(runBound(run, p))));
 }
 
 /// runBound is the most bytes a run can write: its statics, 20 per int, and the actual string lengths.
-inline fn runBound(comptime run: []const Op, p: [*]const u8) usize {
+inline fn runBound(comptime run: []const Instruction, p: [*]const u8) usize {
     comptime var fixed = 0;
-    inline for (run) |op| fixed += switch (op.ins.kind) {
-        .static => op.ins.static.len,
+    inline for (run) |op| fixed += switch (op.kind) {
+        .static => op.static.len,
         .int => pc.max_int_len,
         else => 0,
     };
     var need: usize = fixed;
     inline for (run) |op| {
-        if (op.ins.kind == .string_field) need += field([]const u8, p, op.ins.offset).len;
+        if (op.kind == .string_field) need += field([]const u8, p, op.offset).len;
     }
     return need;
 }
 
 /// putRun writes a run at d, which has room for runBound bytes, and returns the cursor past it.
-inline fn putRun(comptime run: []const Op, p: [*]const u8, cursor: [*]u8) [*]u8 {
+inline fn putRun(comptime run: []const Instruction, p: [*]const u8, cursor: [*]u8) [*]u8 {
     var d = cursor;
-    inline for (run) |op| switch (op.ins.kind) {
+    inline for (run) |op| switch (op.kind) {
         .static => {
-            const v = op.ins.static;
+            const v = op.static;
             d[0..v.len].* = v[0..v.len].*;
             d += v.len;
         },
         .string_field => {
-            const v = field([]const u8, p, op.ins.offset);
+            const v = field([]const u8, p, op.offset);
             buffer.copy(d, v);
             d += v.len;
         },
-        .int => d = pc.putInt(d, field(isize, p, op.ins.offset)),
+        .int => d = pc.putInt(d, field(isize, p, op.offset)),
         .normal => comptime unreachable,
     };
     return d;
@@ -202,18 +138,12 @@ inline fn field(comptime F: type, p: [*]const u8, offset: usize) F {
     return fp.*;
 }
 
-/// Op is the comptime form of an instruction, carrying the nested encoder type to build at init.
-pub const Op = struct {
-    ins: Instruction,
-    nested: ?type = null,
-};
-
 /// EscapeString can be used as the element type of a SliceEncoder in replacement of `[]const u8`,
 /// e.g. SliceEncoder([]const EscapeString), which encodes a `[]const []const u8` with escaping.
 /// You can and should just use the `,escape` option on your struct fields when using StructEncoder.
 pub const EscapeString = struct {};
 
-fn compile(comptime T: type) []const Op {
+fn compile(comptime T: type) []const Instruction {
     comptime {
         @setEvalBranchQuota(100_000);
         var c: Compiler = .{};
@@ -265,7 +195,7 @@ fn compile(comptime T: type) []const Op {
         c.chunk("}");
         c.flunk();
 
-        const out: [c.ops.len]Op = c.ops[0..c.ops.len].*;
+        const out: [c.ops.len]Instruction = c.ops[0..c.ops.len].*;
         return &out;
     }
 }
@@ -311,7 +241,7 @@ pub inline fn deref(comptime F: type, fp: *const anyopaque) ?*const Indirect(F).
 }
 
 const Compiler = struct {
-    ops: []const Op = &.{},
+    ops: []const Instruction = &.{},
     cb: []const u8 = "", // side buffer for static data
 
     // chunk writes a chunk of body data to the chunk buffer. only for writing static
@@ -323,22 +253,22 @@ const Compiler = struct {
     // flunk flushes whatever chunk data we've got buffered into a single instruction
     fn flunk(comptime c: *Compiler) void {
         if (c.cb.len == 0) return;
-        c.ops = c.ops ++ &[_]Op{.{ .ins = .{ .static = c.cb, .kind = .static } }};
+        c.ops = c.ops ++ &[_]Instruction{.{ .static = c.cb, .kind = .static }};
         c.cb = "";
     }
 
-    fn append(comptime c: *Compiler, comptime op: Op) void {
+    fn append(comptime c: *Compiler, comptime ins: Instruction) void {
         c.flunk(); // flush any chunk data we've buffered
-        c.ops = c.ops ++ &[_]Op{op};
+        c.ops = c.ops ++ &[_]Instruction{ins};
     }
 
     fn appendInstructionFun(comptime c: *Compiler, comptime fun: Fun) void {
-        c.append(.{ .ins = .{ .fun = fun } });
+        c.append(.{ .fun = fun });
     }
 
     // val creates an instruction to read from a field we're marshaling
     fn val(comptime c: *Compiler, comptime f: Field, comptime conv: Conv) void {
-        c.append(.{ .ins = .{ .leap_fun = conv, .offset = f.offset } });
+        c.append(.{ .leap_fun = conv, .offset = f.offset });
     }
 
     // ptrval creates an instruction to read from a pointer/optional field we're marshaling
@@ -357,7 +287,7 @@ const Compiler = struct {
     }
 
     fn nested(comptime c: *Compiler, comptime f: Field, comptime Enc: type) void {
-        c.append(.{ .ins = .{ .fun = &NestedVal(Enc, f.F, f.offset, f.indirect()).run }, .nested = Enc });
+        c.appendInstructionFun(&NestedVal(Enc, f.F, f.offset, f.indirect()).run);
     }
 
     fn optInstrStringer(comptime c: *Compiler, comptime f: Field) void {
@@ -403,7 +333,7 @@ const Compiler = struct {
         if (K == isize) {
             // fast path for int fields (go's int)
             if (f.indirect()) return c.ptrval(f, pc.typeconv(isize).?);
-            c.append(.{ .ins = .{ .offset = f.offset, .kind = .int } });
+            c.append(.{ .offset = f.offset, .kind = .int });
             return;
         }
 
@@ -413,7 +343,7 @@ const Compiler = struct {
 
             // otherwise a standard quoted print instruction, using the string fast path
             c.chunk("\"");
-            c.append(.{ .ins = .{ .offset = f.offset, .kind = .string_field } });
+            c.append(.{ .offset = f.offset, .kind = .string_field });
             c.chunk("\"");
             return;
         }
@@ -441,7 +371,7 @@ const Compiler = struct {
                 c.nested(f, SliceEncoder(K));
             },
             .@"struct" => {
-                // build a new StructEncoder for the type; a pointer field to its own type re-uses the current encoder
+                // nest the StructEncoder for the type; recursive types just call back into their own marshal
                 c.nested(f, StructEncoder(K));
             },
             else => unsupported(f),
@@ -455,7 +385,7 @@ fn unsupported(comptime f: Field) noreturn {
 
 fn PtrVal(comptime F: type, comptime offset: usize, comptime conv: Conv, comptime quoted: bool) type {
     return struct {
-        fn run(_: ?*const anyopaque, v: [*]const u8, w: *Buffer) Error!void {
+        fn run(v: [*]const u8, w: *Buffer) Error!void {
             const p = deref(F, @ptrCast(v + offset)) orelse return w.writeStatic(pc.null_lit);
             // quotes need to be at runtime here because we don't know if we're going to have to null the field
             if (quoted) try w.writeByte('"');
@@ -467,19 +397,17 @@ fn PtrVal(comptime F: type, comptime offset: usize, comptime conv: Conv, comptim
 
 fn NestedVal(comptime Enc: type, comptime F: type, comptime offset: usize, comptime indirect: bool) type {
     return struct {
-        fn run(ctx: ?*const anyopaque, v: [*]const u8, w: *Buffer) Error!void {
+        fn run(v: [*]const u8, w: *Buffer) Error!void {
             const fp: *const anyopaque = @ptrCast(v + offset);
             const p: *const anyopaque = if (indirect) deref(F, fp) orelse return w.writeStatic(pc.null_lit) else fp;
-            if (fused) return Enc.marshalFused(p, w);
-            const enc: *const Enc = @ptrCast(@alignCast(ctx.?));
-            return enc.marshalRaw(p, w);
+            return Enc.marshalRaw(p, w);
         }
     };
 }
 
 fn ArrayElem(comptime offset: usize, comptime conv: Conv) type {
     return struct {
-        fn run(_: ?*const anyopaque, v: [*]const u8, w: *Buffer) Error!void {
+        fn run(v: [*]const u8, w: *Buffer) Error!void {
             try conv(@ptrCast(v + offset), w);
         }
     };

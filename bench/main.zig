@@ -17,6 +17,10 @@ const zig_json = if (bench_options.competitors) @import("zig_json") else void;
 const sakakibara_json = if (bench_options.competitors) @import("sakakibara_json") else void;
 const zserde = if (bench_options.competitors) @import("zserde") else void;
 const jsonz = if (bench_options.competitors) @import("jsonz") else void;
+const yyjson = if (bench_options.competitors) @import("yyjson") else void;
+
+/// yyjson builds its document in this pool, reused across calls, so it never calls malloc
+var yyjson_pool: [1 << 20]u8 align(16) = undefined;
 
 const Counting = struct {
     parent: std.mem.Allocator,
@@ -98,12 +102,11 @@ fn bench(name: []const u8, ctx: anytype, comptime f: fn (@TypeOf(ctx)) anyerror!
 
 fn Pooled(comptime Enc: type, comptime V: type) type {
     return struct {
-        enc: *const Enc,
         v: *const V,
 
         fn run(s: @This()) anyerror!void {
             const b = try jz.Buffer.fromPool();
-            try s.enc.marshal(s.v, b);
+            try Enc.marshal(s.v, b);
             std.mem.doNotOptimizeAway(b.bytes.items.ptr);
             b.returnToPool();
         }
@@ -112,12 +115,11 @@ fn Pooled(comptime Enc: type, comptime V: type) type {
 
 fn Reset(comptime Enc: type, comptime V: type) type {
     return struct {
-        enc: *const Enc,
         v: *const V,
         b: *jz.Buffer,
 
         fn run(s: @This()) anyerror!void {
-            try s.enc.marshal(s.v, s.b);
+            try Enc.marshal(s.v, s.b);
             std.mem.doNotOptimizeAway(s.b.bytes.items.ptr);
             s.b.reset();
         }
@@ -138,24 +140,18 @@ fn StdJson(comptime V: type) type {
 }
 
 fn pooled(name: []const u8, comptime T: type, v: *const T) !void {
-    const enc = try jz.StructEncoder(T).init(std.heap.smp_allocator);
-    defer enc.deinit();
-    try bench(name, Pooled(jz.StructEncoder(T), T){ .enc = enc, .v = v }, Pooled(jz.StructEncoder(T), T).run);
+    try bench(name, Pooled(jz.StructEncoder(T), T){ .v = v }, Pooled(jz.StructEncoder(T), T).run);
 }
 
 fn pooledSlice(name: []const u8, comptime S: type, v: *const jz.SliceEncoder(S).Input) !void {
     const Enc = jz.SliceEncoder(S);
-    const enc = try Enc.init(std.heap.smp_allocator);
-    defer enc.deinit();
-    try bench(name, Pooled(Enc, Enc.Input){ .enc = enc, .v = v }, Pooled(Enc, Enc.Input).run);
+    try bench(name, Pooled(Enc, Enc.Input){ .v = v }, Pooled(Enc, Enc.Input).run);
 }
 
 fn reset(name: []const u8, comptime T: type, v: *const T) !void {
-    const enc = try jz.StructEncoder(T).init(std.heap.smp_allocator);
-    defer enc.deinit();
     const b = try jz.Buffer.fromPool();
     defer b.returnToPool();
-    try bench(name, Reset(jz.StructEncoder(T), T){ .enc = enc, .v = v, .b = b }, Reset(jz.StructEncoder(T), T).run);
+    try bench(name, Reset(jz.StructEncoder(T), T){ .v = v, .b = b }, Reset(jz.StructEncoder(T), T).run);
 }
 
 fn stdjson(name: []const u8, comptime T: type, v: *const T) !void {
@@ -172,6 +168,7 @@ const Lib = enum {
     sakakibara_json,
     zserde,
     jsonz,
+    yyjson,
 
     fn name(l: Lib) []const u8 {
         return switch (l) {
@@ -184,15 +181,16 @@ const Lib = enum {
             .sakakibara_json => "sakakibara-json",
             .zserde => "zserde",
             .jsonz => "jsonz",
+            .yyjson => "yyjson",
         };
     }
 
-    /// supports reports whether the library can express a payload at all: only std.json, serde.zig
-    /// and lalinsky/json.zig have custom-serialization hooks, and sakakibara/json-zig and jsonz reject
+    /// supports reports whether the library can express a payload at all: only std.json, serde.zig,
+    /// lalinsky/json.zig and yyjson (raw values) have custom-serialization hooks, and sakakibara/json-zig and jsonz reject
     /// single-item pointer fields.
     fn supports(l: Lib, needs: Needs) bool {
         return switch (l) {
-            .std_json, .serde_zig, .lalinsky_json => true,
+            .std_json, .serde_zig, .lalinsky_json, .yyjson => true,
             .zerde, .zserde, .zig_json => !needs.hooks,
             .jaysan => !needs.hooks and !needs.escaping,
             .sakakibara_json, .jsonz => !needs.hooks and !needs.single_ptrs,
@@ -231,6 +229,7 @@ fn Reused(comptime lib: Lib, comptime V: type) type {
                 },
                 .zserde => try zserde.json.toWriter(s.v.*, w, .{}),
                 .jsonz => try jsonz.typed.toWriter(w, s.v.*, .{}),
+                .yyjson => try yyjson.write(s.v, &yyjson_pool, w),
             }
             std.mem.doNotOptimizeAway(s.out.written().ptr);
         }
@@ -268,24 +267,18 @@ fn jinzigOutput(comptime J: type, v: anytype) ![]u8 {
     const b = try jz.Buffer.fromPool();
     defer b.returnToPool();
     if (comptime @typeInfo(J) == .pointer) {
-        const enc = try jz.SliceEncoder(J).init(std.heap.smp_allocator);
-        defer enc.deinit();
-        try enc.marshal(v, b);
+        try jz.SliceEncoder(J).marshal(v, b);
     } else {
-        const enc = try jz.StructEncoder(J).init(std.heap.smp_allocator);
-        defer enc.deinit();
-        try enc.marshal(v, b);
+        try jz.StructEncoder(J).marshal(v, b);
     }
     return std.heap.smp_allocator.dupe(u8, b.string());
 }
 
 fn resetSlice(name: []const u8, comptime S: type, v: *const jz.SliceEncoder(S).Input) !void {
     const Enc = jz.SliceEncoder(S);
-    const enc = try Enc.init(std.heap.smp_allocator);
-    defer enc.deinit();
     const b = try jz.Buffer.fromPool();
     defer b.returnToPool();
-    try bench(name, Reset(Enc, Enc.Input){ .enc = enc, .v = v, .b = b }, Reset(Enc, Enc.Input).run);
+    try bench(name, Reset(Enc, Enc.Input){ .v = v, .b = b }, Reset(Enc, Enc.Input).run);
 }
 
 /// zigSuite runs one payload through every zig encoder that can express it.
@@ -343,7 +336,6 @@ pub fn main(init: std.process.Init) !void {
         } else return error.UnknownArgument;
     }
 
-    std.debug.print("mode: {s}\n", .{@tagName(jz.mode)});
     if (probe) return probeEscaping();
 
     const slice_strings: []const []const u8 = &p.slice_strings;

@@ -1,9 +1,7 @@
 //! slice_encoder.zig manages SliceEncoder and its responsibilities.
-//! SliceEncoder follows the same principle of struct_encoder.zig in that it generates lightweight
-//! instructions as part of its compile stage which are executed later during marshal. The
-//! slight difference here is that instruction is singular rather than plural. This is due to the
-//! need for slice iteration to be managed from the instruction itself (at 'runtime') as a result
-//! of slices being of variable length.
+//! SliceEncoder follows the same principle of struct_encoder.zig in that every decision about the
+//! element type is made at comptime, leaving a single loop over the elements at runtime. Slices are
+//! of variable length, so unlike a struct the iteration itself can't be unrolled.
 
 const std = @import("std");
 const buffer = @import("buffer.zig");
@@ -90,56 +88,18 @@ pub fn SliceEncoder(comptime S: type) type {
     };
 
     return struct {
-        const Self = @This();
-
-        instruction: *const fn (self: ?*const Self, v: *const anyopaque, w: *Buffer) Error!void,
-        nested: ?*anyopaque,
-        gpa: std.mem.Allocator,
-
         /// Input is the slice type marshal accepts, i.e. []const []const u8 for []const EscapeString
         pub const Input = if (Elem == E) S else []const Elem;
 
-        /// init builds a new SliceEncoder
-        pub fn init(gpa: std.mem.Allocator) Error!*Self {
-            const self = try gpa.create(Self);
-            errdefer gpa.destroy(self);
-            self.* = .{
-                .instruction = &instr,
-                .nested = if (Nested == void) null else try Nested.init(gpa),
-                .gpa = gpa,
-            };
-            return self;
+        /// marshal writes the json document for a given slice to the buffer provided
+        pub fn marshal(s: *const Input, w: *Buffer) Error!void {
+            return marshalRaw(@ptrCast(s), w);
         }
 
-        pub fn deinit(self: *Self) void {
-            if (Nested != void) @as(*Nested, @ptrCast(@alignCast(self.nested.?))).deinit();
-            self.gpa.destroy(self);
-        }
-
-        /// marshal executes the instruction built up by init
-        pub fn marshal(self: *const Self, s: *const Input, w: *Buffer) Error!void {
-            return self.marshalRaw(@ptrCast(s), w);
-        }
-
-        pub fn marshalRaw(self: *const Self, v: *const anyopaque, w: *Buffer) Error!void {
-            if (se.fused) return instr(null, v, w);
-            return self.instruction(self, v, w);
-        }
-
-        pub fn marshalFused(v: *const anyopaque, w: *Buffer) Error!void {
-            return instr(null, v, w);
-        }
-
-        inline fn nest(self: ?*const Self, item: *const anyopaque, w: *Buffer) Error!void {
-            if (se.fused) return Nested.marshalFused(item, w);
-            const n: *const Nested = @ptrCast(@alignCast(self.?.nested.?));
-            return n.marshalRaw(item, w);
-        }
-
-        /// flat elements (plain strings, or structs that are a single run) let the whole slice reserve
-        /// once and write through one cursor, instead of updating the buffer's length per element
-        const flat = se.fused and switch (variant) {
-            .string => true,
+        /// flat elements (plain or nullable strings, or structs that are a single run) let the whole slice
+        /// reserve once and write through one cursor, instead of updating the buffer's length per element
+        const flat = switch (variant) {
+            .string, .ptr_string => true,
             .strct, .ptr_strct => Nested.flat,
             else => false,
         };
@@ -164,6 +124,7 @@ pub fn SliceEncoder(comptime S: type) type {
         inline fn elemBound(item: *const Elem) usize {
             return switch (variant) {
                 .string => item.len + 2,
+                .ptr_string => if (se.deref(Elem, @ptrCast(item))) |s| s.len + 2 else pc.null_lit.len,
                 .strct => Nested.bound(item),
                 .ptr_strct => if (se.deref(Elem, @ptrCast(item))) |s| Nested.bound(s) else pc.null_lit.len,
                 else => comptime unreachable,
@@ -172,25 +133,27 @@ pub fn SliceEncoder(comptime S: type) type {
 
         inline fn putElem(item: *const Elem, d: [*]u8) [*]u8 {
             switch (variant) {
-                .string => {
-                    d[0] = '"';
-                    buffer.copy(d + 1, item.*);
-                    d[item.len + 1] = '"';
-                    return d + item.len + 2;
-                },
+                .string => return putQuoted(item.*, d),
                 .strct => return Nested.put(item, d),
-                .ptr_strct => {
+                .ptr_string, .ptr_strct => {
                     const s = se.deref(Elem, @ptrCast(item)) orelse {
                         d[0..pc.null_lit.len].* = pc.null_lit.*;
                         return d + pc.null_lit.len;
                     };
-                    return Nested.put(s, d);
+                    return if (variant == .ptr_string) putQuoted(s.*, d) else Nested.put(s, d);
                 },
                 else => comptime unreachable,
             }
         }
 
-        fn instr(self: ?*const Self, v: *const anyopaque, w: *Buffer) Error!void {
+        inline fn putQuoted(s: []const u8, d: [*]u8) [*]u8 {
+            d[0] = '"';
+            buffer.copy(d + 1, s);
+            d[s.len + 1] = '"';
+            return d + s.len + 2;
+        }
+
+        pub fn marshalRaw(v: *const anyopaque, w: *Buffer) Error!void {
             const sl: *const []const Elem = @ptrCast(@alignCast(v));
             const items = sl.*;
             if (flat) return putFlat(items, w);
@@ -208,7 +171,7 @@ pub fn SliceEncoder(comptime S: type) type {
                 },
                 .slice, .strct => for (items, 0..) |*item, i| {
                     if (i > 0) try w.writeByte(',');
-                    try nest(self, @ptrCast(item), w);
+                    try Nested.marshalRaw(@ptrCast(item), w);
                 },
                 .other => for (items, 0..) |*item, i| {
                     if (i > 0) try w.writeByte(',');
@@ -228,7 +191,7 @@ pub fn SliceEncoder(comptime S: type) type {
                         continue;
                     };
                     switch (variant) {
-                        .ptr_slice, .ptr_strct => try nest(self, @ptrCast(s), w),
+                        .ptr_slice, .ptr_strct => try Nested.marshalRaw(@ptrCast(s), w),
                         .ptr_string, .ptr_escape_string => {
                             try w.writeByte('"');
                             try conv.?(@ptrCast(s), w);

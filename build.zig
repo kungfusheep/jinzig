@@ -1,22 +1,14 @@
 const std = @import("std");
 
-pub const Mode = enum { interpreted, fused };
-
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-
-    // interpreted executes a runtime instruction set like jingo does; fused unrolls it at comptime
-    const mode = b.option(Mode, "mode", "marshal execution strategy (interpreted|fused)") orelse .interpreted;
-    const options = b.addOptions();
-    options.addOption(Mode, "mode", mode);
 
     const mod = b.addModule("jinzig", .{
         .root_source_file = b.path("src/jinzig.zig"),
         .target = target,
         .optimize = optimize,
     });
-    mod.addOptions("build_options", options);
 
     // the payloads from jingo_test.go, shared by tests and benchmarks
     const payloads = b.createModule(.{
@@ -61,12 +53,13 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         yyjson_h.defineCMacro("YYJSON_DISABLE_UTILS", "1");
+        const yyjson_c = yyjson_h.createModule();
         const zig_json = b.createModule(.{
             .root_source_file = b.path(tp ++ "zig-json/src/root.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
-            .imports = &.{.{ .name = "yyjson_c", .module = yyjson_h.createModule() }},
+            .imports = &.{.{ .name = "yyjson_c", .module = yyjson_c }},
         });
         zig_json.addIncludePath(b.path(tp ++ "zig-json/vendor/yyjson"));
         zig_json.addCSourceFile(.{ .file = b.path(tp ++ "zig-json/vendor/yyjson/yyjson.c"), .flags = &.{ "-std=c99", "-DYYJSON_DISABLE_UTILS=1" } });
@@ -82,6 +75,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "sakakibara_json", .module = sakakibara },
             .{ .name = "zserde", .module = zserde },
             .{ .name = "jsonz", .module = jsonz },
+            .{ .name = "yyjson", .module = b.createModule(.{
+                .root_source_file = b.path("bench/yyjson.zig"),
+                .imports = &.{ .{ .name = "jinzig", .module = mod }, .{ .name = "yyjson_c", .module = yyjson_c } },
+            }) },
         }) catch @panic("OOM");
     }
     const imports = import_list.items;
@@ -99,7 +96,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tests.step);
 
     const bench = b.addExecutable(.{
-        .name = b.fmt("jinzig-bench-{s}", .{@tagName(mode)}),
+        .name = "jinzig-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("bench/main.zig"),
             .target = target,

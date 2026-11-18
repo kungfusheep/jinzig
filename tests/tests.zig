@@ -3,18 +3,19 @@ const testing = std.testing;
 const jz = @import("jinzig");
 const p = @import("payloads");
 
-/// marshal encodes v with a fresh StructEncoder and pooled buffer, then checks the output is exact
+test {
+    _ = @import("nesting.zig");
+}
+
+/// expectStruct encodes v into a pooled buffer, then checks the output is exact
 fn expectStruct(comptime T: type, v: *const T, want: []const u8) !void {
     jz.buffer.allocator = testing.allocator;
     defer jz.Buffer.drainPool();
 
-    const enc = try jz.StructEncoder(T).init(testing.allocator);
-    defer enc.deinit();
-
     const b = try jz.Buffer.fromPool();
     defer b.returnToPool();
 
-    try enc.marshal(v, b);
+    try jz.StructEncoder(T).marshal(v, b);
     try testing.expectEqualStrings(want, b.string());
 }
 
@@ -22,13 +23,10 @@ fn expectSlice(comptime S: type, v: *const jz.SliceEncoder(S).Input, want: []con
     jz.buffer.allocator = testing.allocator;
     defer jz.Buffer.drainPool();
 
-    const enc = try jz.SliceEncoder(S).init(testing.allocator);
-    defer enc.deinit();
-
     const b = try jz.Buffer.fromPool();
     defer b.returnToPool();
 
-    try enc.marshal(v, b);
+    try jz.SliceEncoder(S).marshal(v, b);
     try testing.expectEqualStrings(want, b.string());
 }
 
@@ -273,6 +271,22 @@ test "stringer and pointer stringer" {
     try expectStruct(T, &.{ .c = .red, .pc = &r }, "{\"c\":\"red\",\"pc\":\"red\"}");
 }
 
+test "jingo quirks: quoted null stringer, spaced arrays, null raw on non-bytes" {
+    const Color = enum {
+        red,
+        pub fn string(c: *const @This()) []const u8 {
+            return @tagName(c.*);
+        }
+    };
+    const T = struct {
+        pc: ?*const Color,
+        a: [3]isize,
+        r: isize,
+        pub const json_tags = .{ .pc = "pc,stringer", .a = "a", .r = "r,raw" };
+    };
+    try expectStruct(T, &.{ .pc = null, .a = .{ 1, 2, 3 }, .r = 7 }, "{\"pc\":\"null\",\"a\":[1, 2, 3],\"r\":null}");
+}
+
 test "escape on pointer strings and slices of pointer strings" {
     const T = struct {
         s: ?*const []const u8,
@@ -309,6 +323,9 @@ test "slice encoder element kinds" {
     const t: p.DSTopic = .{ .ID = -12345678901, .slug = "" };
     try expectSlice([]const ?*const p.DSTopic, &&.{ null, &t, null }, "[null,{\"ID\":-12345678901,\"slug\":\"\"},null]");
     try expectSlice([]const ?*const p.DSTopic, &&.{}, "[]");
+    const empty: []const u8 = "";
+    try expectSlice([]const ?*const []const u8, &&.{ null, &empty, null }, "[null,\"\",null]");
+    try expectSlice([]const ?*const []const u8, &&.{}, "[]");
     try expectSlice([]const jz.EscapeString, &&.{ "a\\b", "\n" },
         \\["a\\b","\n"]
     );
@@ -382,7 +399,7 @@ test "golden: output is byte-identical to go jingo" {
 
 const bench_options = @import("bench_options");
 
-fn expectLib(comptime lib: enum { std_json, serde_zig, zerde }, v: anytype, golden: []const u8) !void {
+fn expectLib(comptime lib: enum { std_json, serde_zig, zerde, yyjson }, v: anytype, golden: []const u8) !void {
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     switch (lib) {
@@ -392,8 +409,13 @@ fn expectLib(comptime lib: enum { std_json, serde_zig, zerde }, v: anytype, gold
             const zerde = @import("zerde");
             try zerde.serialize(zerde.json, &out.writer, v);
         },
+        .yyjson => {
+            const pool = try testing.allocator.alloc(u8, 1 << 20);
+            defer testing.allocator.free(pool);
+            try @import("yyjson").write(v, pool, &out.writer);
+        },
     }
-    // the one known divergence: std.json widens f32 to f64 precision (jingo, serde.zig and zerde
+    // the one known divergence: std.json widens f32 to f64 precision (jingo, serde.zig, zerde and yyjson
     // print the shortest f32 form), so its expected document carries the widened digits
     const want = if (lib == .std_json)
         try std.mem.replaceOwned(u8, testing.allocator, golden, "\"propFloat32\":21.232426,", "\"propFloat32\":21.232425689697266,")
@@ -412,7 +434,7 @@ test "golden: competing zig encoders produce the same documents as jingo" {
     const slice: []const []const u8 = &p.slice_strings;
 
     // std.json is always available; the hooks in payloads.zig reproduce jingo's encoder fields
-    inline for (.{ .std_json, .serde_zig, .zerde }) |lib| {
+    inline for (.{ .std_json, .serde_zig, .zerde, .yyjson }) |lib| {
         if (lib == .std_json or bench_options.competitors) {
             try expectLib(lib, &p.unicode, g("unicode"));
             try expectLib(lib, &p.unicode_large, g("unicode_large"));
@@ -448,9 +470,6 @@ test "simd escape matches the byte-at-a-time reference at every length and posit
         s: []const u8,
         pub const json_tags = .{ .s = "s,escape" };
     };
-    const enc = try jz.StructEncoder(T).init(testing.allocator);
-    defer enc.deinit();
-
     var prng: std.Random.DefaultPrng = .init(0x5eed);
     const r = prng.random();
     const alphabet = "\"\\\n\r\t\x00\x7f\xc3\xa9abcdefgh ";
@@ -471,8 +490,19 @@ test "simd escape matches the byte-at-a-time reference at every length and posit
 
             const b = try jz.Buffer.fromPool();
             defer b.returnToPool();
-            try enc.marshal(&.{ .s = s }, b);
+            try jz.StructEncoder(T).marshal(&.{ .s = s }, b);
             try testing.expectEqualStrings(want.items, b.string());
         }
     }
+}
+
+test "readme example" {
+    const MyPayload = struct {
+        name: []const u8,
+        age: isize,
+        id: isize,
+        pub const json_tags = .{ .name = "name", .age = "age" };
+    };
+    try expectStruct(MyPayload, &.{ .name = "Mr Payload", .age = 33, .id = 1 }, "{\"name\":\"Mr Payload\",\"age\":33}");
+    try expectSlice([]const []const u8, &&.{ "a", "b" }, "[\"a\",\"b\"]");
 }

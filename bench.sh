@@ -1,6 +1,6 @@
 #!/bin/bash
-# runs jingo's go benchmarks and both jinzig modes sequentially, then prints a comparison table.
-# side effects: writes results/{go,interpreted,fused}.txt and results/report.md, and fetches
+# runs jingo's go benchmarks and then jinzig's, then prints a comparison table.
+# side effects: writes results/{go,zig}.txt and results/report.md, and fetches
 # bench/third_party/ (zerde, serde.zig) on first run
 set -Eeuo pipefail
 
@@ -13,16 +13,12 @@ rm -f results/report.md
 
 [ -d bench/third_party/zerde ] && [ -d bench/third_party/serde.zig ] || bench/third_party.sh
 
-for m in interpreted fused; do
-  zig build -Dmode="$m" -Dcompetitors=true -Doptimize=ReleaseFast -p "zig-out/$m"
-done
+zig build -Dcompetitors=true -Doptimize=ReleaseFast
 
 echo "go: jingo (count=$count, ${benchtime_ms}ms)" >&2
 (cd "$jingo" && GO111MODULE=off go test -vet=off -run '^$' -bench . -benchmem -count "$count" -benchtime "${benchtime_ms}ms") > results/go.txt
 
-for m in interpreted fused; do
-  echo "zig: $m (count=$count, ${benchtime_ms}ms)" >&2
-  "zig-out/$m/bin/jinzig-bench-$m" -count "$count" -benchtime "$benchtime_ms" 2> results/"$m".txt
-done
+echo "zig: jinzig (count=$count, ${benchtime_ms}ms)" >&2
+zig-out/bin/jinzig-bench -count "$count" -benchtime "$benchtime_ms" 2> results/zig.txt
 
-python3 tools/report.py results/go.txt results/interpreted.txt results/fused.txt | tee results/report.md
+python3 tools/report.py results/go.txt results/zig.txt | tee results/report.md
