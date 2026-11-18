@@ -40,7 +40,7 @@ and how it's all measured are in [PERFORMANCE.md](PERFORMANCE.md).
 | jinzig, every string `,escape` | 13.7 | 0 | 0 | 9.5x |
 | std.json | 131 | 0 | 0 | 1.0x |
 | lalinsky-json | 29.1 | 0 | 0 | 4.5x |
-| jaysan | 38.7 | 0 | 0 | 3.4x |
+| jaysan (never escapes) | 38.7 | 0 | 0 | 3.4x |
 | jingo (go, for reference) | 53.6 | 0 | 0 | 2.4x |
 
 **LargePayload**
@@ -50,33 +50,21 @@ and how it's all measured are in [PERFORMANCE.md](PERFORMANCE.md).
 | **jinzig** | 277 | 0 | 0 | 16.7x |
 | jinzig, every string `,escape` | 1,143 | 0 | 0 | 4.0x |
 | std.json | 4,618 | 0 | 0 | 1.0x |
-| jaysan | 1,762 | 0 | 0 | 2.6x |
+| jaysan (never escapes) | 1,762 | 0 | 0 | 2.6x |
 | lalinsky-json | 1,948 | 0 | 0 | 2.4x |
 | jingo (go, for reference) | 2,770 | 0 | 0 | 1.7x |
-
-**Json**
-
-| Lib | ns/op | B/op | allocs/op | vs std.json |
-| --- | ---: | ---: | ---: | ---: |
-| **jinzig** | 312 | 0 | 0 | 9.9x |
-| jinzig, every string `,escape` | 1,053 | 0 | 0 | 2.9x |
-| std.json | 3,090 | 0 | 0 | 1.0x |
-| yyjson | 1,282 | 0 | 0 | 2.4x |
-| lalinsky-json | 1,428 | 0 | 0 | 2.2x |
-| jingo (go, for reference) | 2,081 | 0 | 0 | 1.5x |
 <!-- /bench:summary -->
 
 ### Caveats
 
 - **Strings aren't escaped unless you ask.** Like jingo, jinzig copies strings as they are, so a `"` or a newline in
-  a field without `,escape` gives you invalid JSON. Every other library here escapes every string, always. The
-  "every string `,escape`" rows are the like-for-like numbers: there, jinzig's lead over the next fastest library
-  is 1.2–2.7x rather than up to 6x.
+  a field without `,escape` gives you invalid JSON. Every other library here escapes every string, always, except
+  jaysan, which never does. The "every string `,escape`" rows are the like-for-like numbers: across every payload
+  in [PERFORMANCE.md](PERFORMANCE.md), jinzig's lead over the next fastest escaping library is 1.2–2.7x rather
+  than up to 6x.
 - **The payloads are jingo's**: mostly strings and ints. Floats go through `std.fmt` as they do everywhere else, so
   float-heavy documents will narrow the gap.
-- **They're microbenchmarks**: one payload in a hot loop. Real workloads will see smaller differences.
-- **Zig's JSON encoders are young.** jinzig inherits a design that was tuned against Go's fastest encoders, and the
-  others haven't had that fight yet.
+- **They're microbenchmarks**: one payload in a hot loop. Real workloads could see different results.
 
 ## Tag options
 

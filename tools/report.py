@@ -77,7 +77,7 @@ def zig_table(zig, suite, rows, libs, title):
         print(f"\nAllocating at steady state: {', '.join(allocs)}")
 
 
-SUMMARY_ROWS = ["SmallPayload", "LargePayload", "Json"]
+SUMMARY_ROWS = ["SmallPayload", "LargePayload"]
 
 
 def summary(go, zig, libs):
@@ -90,7 +90,7 @@ def summary(go, zig, libs):
             if l != "std.json" and f"Zig/{r}/{l}" in zig and f"Zig/{r}/{l}" not in mismatched
         )[:2]
         rows = [("**jinzig**", zig[f"Zig/{r}/jinzig"]), ("jinzig, every string `,escape`", zig[f"Esc/{r}/jinzig"]), ("std.json", zig[f"Zig/{r}/std.json"])]
-        rows += [(l, zig[f"Zig/{r}/{l}"]) for _, l in others]
+        rows += [(l + (" (never escapes)" if l == "jaysan" else ""), zig[f"Zig/{r}/{l}"]) for _, l in others]
         rows.append(("jingo (go, for reference)", go[r]))
         print(f"\n**{r}**\n")
         print("| Lib | ns/op | B/op | allocs/op | vs std.json |")

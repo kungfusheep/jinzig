@@ -10,8 +10,6 @@ The detail behind the [README](README.md)'s summary: how the numbers are made, e
 - **The payloads are jingo's**: mostly strings and ints, few floats, nothing that needs escaping in the default
   suite. jinzig formats floats through `std.fmt` like the others, so float-heavy documents narrow the gap.
 - **These are microbenchmarks**: one payload in a hot loop, with warm caches and trained branch predictors.
-- **Zig's JSON encoders are young.** None has had the years of competitive tuning Go's have had, while jinzig
-  inherits a design that was tuned against Go's fastest. That, more than anything clever, is why the gaps are large.
 
 ## Method
 
